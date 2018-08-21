@@ -59,22 +59,36 @@ def epsilon_greedy_quantile_regression(online_net, observation_space_shape, num_
 
         return TFFunction(inputs=[state, epsilon],
                           outputs=action)
-    
 
+# TODO: Make this support any random process (have a parameter random_process and get rid of stddev placeholder)
+#       This will probably require some global variable t, which may be troubling if we save/load an agent (perhaps have a reset_time parameter ?!)
+def gaussian_random_process_naf(online_net, observation_space_shape, action_space_shape, action_space_low, action_space_high):
+    with tf.variable_scope('act'):
+        state = tf.placeholder(tf.float32, shape=list(observation_space_shape), name='state')
+        stddev = tf.placeholder(tf.float32, shape=[])
+
+        expanded_state = tf.expand_dims(state, axis=0)
+        greedy_action, _, _ = online_net(expanded_state)
+        action = tf.squeeze(greedy_action, axis=0)
+        action = tf.clip_by_value(action + stddev * tf.random_normal(action_space_shape), action_space_low, action_space_high)        
+
+        return TFFunction(inputs=[state, stddev],
+                          outputs=action)
+
+    
 class EpsilonGreedy:
     def __init__(self, epsilon_annealing_schedule):
         self.annealing_schedule = epsilon_annealing_schedule
 
     def build(self, agent):
-        # TODO: Add error handling if loss is not defined
         loss_type = agent.loss_spec.type
 
         if loss_type == 'td_error':
-            func = epsilon_greedy_td_error(agent.online_net, agent.observation_space_shape, agent.num_actions)
+            func = epsilon_greedy_td_error(agent.online_net, agent.observation_space.shape, agent.action_space.n)
         elif loss_type == 'categorical_algorithm':
-            func = epsilon_greedy_categorical_algorithm(agent.online_net, agent.observation_space_shape, agent.num_actions, agent.network_spec.n, agent.loss_spec.v_min, agent.loss_spec.v_max) 
+            func = epsilon_greedy_categorical_algorithm(agent.online_net, agent.observation_space.shape, agent.action_space.n, agent.network_spec.n, agent.loss_spec.v_min, agent.loss_spec.v_max) 
         elif loss_type == 'quantile_regression':
-            func = epsilon_greedy_quantile_regression(agent.online_net, agent.observation_space_shape, agent.num_actions, agent.network_spec.n)
+            func = epsilon_greedy_quantile_regression(agent.online_net, agent.observation_space.shape, agent.action_space.n, agent.network_spec.n)
         else:
             raise NotImplementedError("Loss type '" + loss_type + "' is not supported for epsilon greedy")
 
@@ -82,23 +96,75 @@ class EpsilonGreedy:
             epsilon = self.annealing_schedule.value(agent.num_acts)
             return func(state, epsilon)
         return act
+    
+
+class GaussianRandomProcess:
+    def __init__(self, stddev_annealing_schedule):
+        self.stddev_annealing_schedule = stddev_annealing_schedule
+
+    def build(self, agent):
+        loss_type = agent.loss_spec.type
+
+        if loss_type == 'naf':
+            func = gaussian_random_process_naf(online_net=agent.online_net, observation_space_shape=agent.observation_space.shape, action_space_shape=agent.action_space.shape, action_space_low=agent.action_space.low, action_space_high=agent.action_space.high)
+        else:
+            raise NotImplementedError("Loss type '" + loss_type + "' is not supported for random processes")
+
+        def act(state):
+            stddev = self.stddev_annealing_schedule.value(agent.num_acts)
+            return func(state, stddev)
+        return act
+        
             
 
 ### Update Target ###
 
-def build_update_target(q_online_vars, q_target_vars):
-    ## TODO: Perhaps add in a variable scope
-    updates = []
-    for q_online_var, q_target_var in zip(sorted(q_online_vars, key=lambda var: var.name),
-                                          sorted(q_target_vars, key=lambda var: var.name)):
-        updates.append(q_target_var.assign(q_online_var))
+def build_soft_update(online_vars, target_vars, tau):
+    with tf.variable_scope('update'):
+        tau = float(tau)
+        updates = []
+        for online_var, target_var in zip(sorted(online_vars, key=lambda var: var.name),
+                                          sorted(target_vars, key=lambda var: var.name)):
+            updates.append(target_var.assign(tau * online_var + (1.0 - tau) * target_var))
 
-    return TFFunction(inputs=[], outputs=[], updates=updates)
+        return TFFunction(inputs=[], outputs=[], updates=updates)
+
+def build_hard_update(online_vars, target_vars):
+    with tf.variable_scope('update'):
+        updates = []
+        for online_var, target_var in zip(sorted(online_vars, key=lambda var: var.name),
+                                          sorted(target_vars, key=lambda var: var.name)):
+
+            updates.append(target_var.assign(online_var))
+
+        return TFFunction(inputs=[], outputs=[], updates=updates)
 
 
 class UpdateTarget:
+    @property
+    def type(self):
+        raise NotImplementedError
+
+
+class SoftUpdate(UpdateTarget):
+    def __init__(self, tau):
+        self.tau = tau
+    
     def build(self, agent):
-        return build_update_target(agent.online_net.global_variables, agent.target_net.global_variables)
+        return build_soft_update(agent.online_net.global_variables, agent.target_net.global_variables, tau=self.tau)
+
+    @property
+    def type(self):
+        return 'soft'
+    
+
+class HardUpdate(UpdateTarget):
+    def build(self, agent):
+        return build_hard_update(agent.online_net.global_variables, agent.target_net.global_variables)
+    
+    @property
+    def type(self):
+        return 'hard'
 
 
 ### DQN priorities and loss optimizers ###
@@ -137,7 +203,7 @@ def build_td_error_loss(observation_space_shape, num_actions, q_online, q_target
 
         # Perhaps make huber loss an option (and especially the delta an option !)
         #TODO: Explain the use of Huber Loss, referencing the original paper
-        #losses = tf.losses.huber_loss(labels=tf.stop_gradient(targets), predictions=predictions, reduction=tf.losses.Reduction.NONE)
+        #losses = tf.losses.huber_loss(labels=tf.stop_gradient(targets), predictions=predictions, reduction=tf.losses.Reduction.NONE)   <-- but we need td_errors
         losses = tf_huber_loss(td_errors)
         weighted_loss = tf.reduce_mean(importance_weights * losses)
 
@@ -164,13 +230,16 @@ def build_categorical_algorithm(z_online, z_target, observation_space_shape, v_m
 
         atoms = tf.linspace(float(v_min), float(v_max), num_atoms)
         delta_z = (v_max - v_min) / (num_atoms - 1)
-        
+
+        # TODO: Might be better to make batch_size a constant (should avoid calculating indexes every run)
         batch_size = tf.shape(states_t)[0]
         batch_indexes = tf.range(0, batch_size)
 
         states_t_logits = z_online(states_t)
         states_t_indexes = tf.stack([batch_indexes, actions_t], axis=-1)  # effectively zips the two tensors ("lists")
         states_t_actions_t_logits = tf.gather_nd(states_t_logits, states_t_indexes)
+
+        # TODO: May be able to do above gather_nd (and below) using only gather with no need for batch_indexes ?
 
         target_states_tpn_logits = z_target(states_tpn)
         target_states_tpn_prob_distributions = tf.nn.softmax(target_states_tpn_logits)
@@ -288,6 +357,68 @@ def build_quantile_regression_loss(z_online, z_target, observation_space_shape, 
                           updates=[optimize_op])
 
 
+# NOTE: NOT TESTED
+def build_naf_loss(naf_network_online, naf_network_target, batch_size, observation_space_shape, action_space_shape, diagonal_l, optimizer=None):
+    with tf.variable_scope('naf_loss'):
+        # NOTE: May need to handle case when action_space_shape is just (1,)
+        # TODO: If we keep batch_size as a parameter, then switch [None]'s below to batch_size
+        states_t = tf.placeholder(tf.float32, shape=[batch_size] + list(observation_space_shape), name='states_t')
+        actions_t = tf.placeholder(tf.float32, shape=[batch_size] + list(action_space_shape), name='actions_t')
+        rewards_tn = tf.placeholder(tf.float32, shape=[batch_size], name='rewards_tn')
+        states_tpn = tf.placeholder(tf.float32, shape=[batch_size] + list(observation_space_shape), name='states_tpn')
+        gammas_t = tf.placeholder(tf.float32, shape=[batch_size], name='gammas_t')
+        importance_weights = tf.placeholder(tf.float32, shape=[batch_size], name='importance_weights')
+
+        online_mu_t, online_values_t, online_flatL_t = naf_network_online(states_t)
+
+        if diagonal_l:
+            online_p_t = tf.matrix_diag(tf.square(tf.exp(online_flatL_t)))
+        else:
+            lower_triangular_indexes = list(zip(*np.tril_indices(action_space_shape[0])))
+            batch_indexes = np.repeat(np.arange(batch_size), len(lower_triangular_indexes))
+            batch_indexes = np.reshape(batch_indexes, (-1, 1))
+            lower_triangular_indexes = np.tile(lower_triangular_indexes, (batch_size, 1))
+            lower_triangular_indexes = np.hstack((batch_indexes, lower_triangular_indexes))
+
+            # Formula (1/2 * n * (n + 3)) for the sequence of diagonal indexes (the flat indexes) 0, 2, 5, 9, ... etc. derived from https://math.stackexchange.com/questions/2449751/1-2-4-7-11-16-22
+            nums = np.arange(action_space_shape[0])
+            diagonal_indexes = nums * (nums + 3) // 2
+
+            # Note: Here we scatter the digonals which we later overwrite with the exponeniated diagonals
+            #       Scattering only the non-diagonals requires gathering the non-diagonals and then scattering, which *seems* to be more computation than just scattering them all
+            online_l_not_exp_diag_t = tf.scatter_nd(indices=lower_triangular_indexes, updates=tf.reshape(online_flatL_t, (-1,)), shape=[batch_size, action_space_shape[0], action_space_shape[0]])
+            diagonals = tf.gather(online_flatL_t, diagonal_indexes, axis=1)
+            online_l_t = tf.matrix_set_diag(online_l_not_exp_diag_t, tf.exp(diagonals))
+            online_p_t = tf.matmul(online_l_t, online_l_t, transpose_b=True)
+
+        mu_diffs = actions_t - online_mu_t
+        online_advantages_t = tf.squeeze(-0.5 * tf.expand_dims(mu_diffs, 1) @ online_p_t @ tf.expand_dims(mu_diffs, 2))
+        online_q_t = online_advantages_t + online_values_t
+
+        _, target_values_tpn, _ = naf_network_target(states_tpn)
+        targets = rewards_tn + gammas_t * target_values_tpn
+        
+        td_errors = tf.stop_gradient(targets) - online_q_t
+##        naf_losses = tf_huber_loss(td_errors)
+##        weighted_loss = tf.reduce_mean(importance_weights * naf_losses)
+        weighted_loss = tf.losses.mean_squared_error(tf.stop_gradient(targets), online_q_t, importance_weights)
+        
+        if optimizer is None:
+            optimizer = tf.train.AdamOptimizer()
+        # TODO: There is a trick going on  here for variable_scope.  Assuming loss uses online_net first, the global variables are created under this function's scope (naf_loss)
+        #       We pass these variables (with scope naf_loss/../...), and then the variables from the optimizer are defined under naf_loss/naf_loss/.../.. since they are again defined in this function's scope
+        #       This is important because later on when we use update_targets, if these variables were under just naf_loss/.../,
+        #       the online_net would receive extra global_variables from the optimizer (i.e. Adam variables) since the target_net doesn't use an optimizer
+        #       See if we can find a cleaner way to handle this.  This is an 'issue' for all loss functions.
+        #       An easy solution should be to just put a new variable scope around this line of code, but that seems ugly and still needs an explanation
+        #       Perhaps later we can move optimization out of the loss function to not have to think about this issue (if we want evolutionary optimizers, for example)
+        optimize_op = optimizer.minimize(weighted_loss, var_list=naf_network_online.global_variables)
+
+        return TFFunction(inputs=[states_t, actions_t, rewards_tn, states_tpn, gammas_t, importance_weights],
+                          outputs=td_errors,
+                          updates=[optimize_op])
+
+
 # TODO: Probably turn below into abstract class ?  type doesn't need to be overridden with @property, just def type()
 
 class Loss:
@@ -305,7 +436,7 @@ class TDErrorLoss(Loss):
         if agent.network_spec.type != 'q_network':
             raise NotImplementedError("TDErrorLoss not implemented (or not compatible) with network type '" + agent.network_spec.type + "'")
 
-        return build_td_error_loss(observation_space_shape=agent.observation_space_shape, num_actions=agent.num_actions, q_online=agent.online_net, q_target=agent.target_net, double_q=self.double_q, optimizer=self.optimizer)
+        return build_td_error_loss(observation_space_shape=agent.observation_space.shape, num_actions=agent.action_space.n, q_online=agent.online_net, q_target=agent.target_net, double_q=self.double_q, optimizer=self.optimizer)
 
     @property
     def type(self):
@@ -328,7 +459,7 @@ class CategoricalAlgorithm(Loss):
         if agent.network_spec.type != 'distributional':
             raise NotImplementedError("CategoricalAlgorithm not implemented (or not compatible) with network type '" + agent.network_spec.type + "'")
 
-        return build_categorical_algorithm(z_online=agent.online_net, z_target=agent.target_net, observation_space_shape=agent.observation_space_shape, num_atoms=agent.network_spec.n, v_min=self.v_min, v_max=self.v_max, double_q=self.double_q, optimizer=self.optimizer)               
+        return build_categorical_algorithm(z_online=agent.online_net, z_target=agent.target_net, observation_space_shape=agent.observation_space.shape, num_atoms=agent.network_spec.n, v_min=self.v_min, v_max=self.v_max, double_q=self.double_q, optimizer=self.optimizer)               
 
     @property
     def type(self):
@@ -345,8 +476,23 @@ class QuantileRegressionLoss(Loss):
         if agent.network_spec.type != 'distributional':
             raise NotImplementedError("QuantileRegressionLoss not implemented (or not compatible) with network type '" + agent.network_spec.type + "'")
 
-        return build_quantile_regression_loss(z_online=agent.online_net, z_target=agent.target_net, observation_space_shape=agent.observation_space_shape, num_quantiles=agent.network_spec.n, kappa=self.kappa, double_q=self.double_q, optimizer=self.optimizer)
+        return build_quantile_regression_loss(z_online=agent.online_net, z_target=agent.target_net, observation_space_shape=agent.observation_space.shape, num_quantiles=agent.network_spec.n, kappa=self.kappa, double_q=self.double_q, optimizer=self.optimizer)
 
     @property
     def type(self):
         return 'quantile_regression'
+
+
+class NAFLoss(Loss):
+    def __init__(self, optimizer=None):
+        self.optimizer = optimizer
+
+    def build(self, agent):
+        if agent.network_spec.type != 'naf':
+            raise NotImplementedError("NAFLoss not implemented (or not compatible) with network type '" + agent.network_spec.type + "'")
+
+        return build_naf_loss(naf_network_online=agent.online_net, naf_network_target=agent.target_net, batch_size=agent.batch_size, observation_space_shape=agent.observation_space.shape, action_space_shape=agent.action_space.shape, diagonal_l=agent.network_spec.diagonal_l, optimizer=self.optimizer)
+
+    @property
+    def type(self):
+        return 'naf'

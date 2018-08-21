@@ -1,153 +1,102 @@
 import numpy as np
-import math
 import random
-from collections import namedtuple
+from collections import namedtuple, deque
+from dqn.data_structures import SumSegmentTree, MinSegmentTree, MaxPriorityQueue
 
-Experience = namedtuple("Experience", ["state", "reward", "action", "next_state", "terminal"])
+Experience = namedtuple("Experience", ["state_t", "action_t", "reward_tn", "state_tpn", "gamma_n"])
 
-## Max priority queue with a maximum capacity.  Removes oldest elements first.  No pop() currently supported
-## TODO: perhaps rename this to something to indicate the cap (CappedMaxPriorityQueue)
-class MaxPriorityQueue:
+class Simple:
     def __init__(self, capacity):
-        self._heap = []
-        self._capacity = capacity
-        self._oldest_order_index = 0
-        self._order_to_priority = {}
+        self._memories = deque(maxlen=capacity)
 
-    def _swap_indexes(self, parent_priority_index, child_priority_index):
-        # TODO: Maybe make comment about how this should be called before swapping heap elements (order_ids)
-        parent_order_index = self._heap[parent_priority_index][1]
-        child_order_index = self._heap[child_priority_index][1]
-
-        self._order_to_priority[parent_order_index] = child_priority_index
-        self._order_to_priority[child_order_index] = parent_priority_index
+    def store(self, state_t, action_t, reward_tn, state_tpn, gamma_n):
+        experience = Experience(state_t, action_t, reward_tn, state_tpn, gamma_n)
+        self._memories.append(experience)
         
-    def _up_heap(self, index):
-        if index > 0:
-            parent_index = math.floor((index - 1) / 2)
-
-            if self._heap[parent_index] < self._heap[index]:
-                # Swap parent with child
-                self._swap_indexes(parent_index, index)
-                self._heap[parent_index], self._heap[index] = self._heap[index], self._heap[parent_index]
-                
-                self._up_heap(parent_index)
-            
-    def _down_heap(self, index):
-        left_index, right_index = 2*index + 1, 2*index + 2
-        largest = index
-
-        if left_index < len(self._heap) and self._heap[left_index] > self._heap[largest]:
-            largest = left_index
-        if right_index < len(self._heap) and self._heap[right_index] > self._heap[largest]:
-            largest = right_index
-
-        if largest != index:
-            # Swap parent with child
-            self._swap_indexes(index, largest)
-            self._heap[index], self._heap[largest] = self._heap[largest], self._heap[index]
-            
-            self._down_heap(largest)
-
-    def insert(self, priority, data):
-        if len(self._heap) < self._capacity:
-            self._heap.append((priority, self._oldest_order_index, data))
-            
-            priority_index = len(self._heap) - 1
-            self._order_to_priority[self._oldest_order_index] = priority_index
-
-            self._up_heap(priority_index)
-        else:
-            oldest_priority_index = self._order_to_priority[self._oldest_order_index]
-            self._heap[oldest_priority_index] = (priority, self._oldest_order_index, data)
-            
-            self._up_heap(oldest_priority_index)
-            self._down_heap(oldest_priority_index)
-
-        self._oldest_order_index = (self._oldest_order_index + 1) % self._capacity
-
-    def update_priorities(self, order_indexes, priorities):
-        for order_index, priority in zip(order_indexes, priorities):
-            priority_index = self._order_to_priority[order_index]
-            data = self._heap[priority_index][2]
-            self._heap[priority_index] = (priority, order_index, data)
-            
-            self._up_heap(priority_index)
-            self._down_heap(priority_index)
-
-    # Pop seems to make the structure much more complicated (this may not be true), and in our case it is unneeded
-    # For example, if we pop an element and add a new one in, there is a (very high: 1 - 1/n) chance that
-    #    there will be two elements in the heap with the same order_id, which would make our dictionary approach
-    #    implausible (two identical keys)
-
-    # There may be a shifting technique, but this will probably require shifting upto n elements in the array and
-    #    this technique may have its own issues (meaning perhaps there isn't a shifting technique)
-
-##    def pop(self):
-##        max_priority = self._heap[0]
-##        last_item = self._heap.pop(-1)
-##
-##        if len(self._heap) > 1:
-##            # Remove the last value of the heap and put it as the root, then bring it down the heap
-##            ### TODO: Do we need to look after other stuff here (yes) ?!
-##            self._heap[0] = last_item
-##            self._down_heap(0)
-##
-##        return max_priority
-
-    def peak(self):
-        return self._heap[0]
-
-    def max_priority(self):
-        if len(self._heap) == 0:    # TODO: Should we use a value other than 0 (perhaps allow init to do this)?!
-            return 0
-        
-        return self._heap[0][0]
-
-    # TODO: Perhaps implement slicing (it may already be implemented if we return the whole tuple!)
-    # https://stackoverflow.com/questions/2936863/python-implementing-slicing-in-getitem
-    def __getitem__(self, key):
-        """Returns (priority, order_id, data)"""
-        return self._heap[key]
-
-    def sort(self):
-        sorted_heap = sorted(self._heap, reverse=True)
-        
-        for priority_index in range(len(sorted_heap)):
-            order_index = sorted_heap[priority_index][1]
-            self._order_to_priority[order_index] = priority_index
-
-        self._heap = sorted_heap
-
-    def _print_tree(self, string="", index=0, indent=0):
-        string += '\t' * indent + str(self._heap[index]) + '\n'
-        left_child_index, right_child_index = 2*index + 1, 2*index + 2
-
-        if left_child_index < len(self._heap):
-            string = self._print_tree(string, left_child_index, indent + 1)
-        if right_child_index < len(self._heap):
-            string = self._print_tree(string, right_child_index, indent + 1)
-
-        # Remove trailing '\n' from last element in the heap (len('\n') == 1)
-        if index == 0:
-            return string[:-1]
-        
-        return string
-
-    def __str__(self):
-        return self._print_tree()
+    def sample(self, batch_size):
+        # TODO: Perhaps ensure len(self._memories) >= batch_size
+        # Note: random.sample does not allow repeats.  Do we want to allow them ?
+        return random.sample(self._memories, batch_size)
 
     def __len__(self):
-        return len(self._heap)
+        return len(self._memories)
     
+
+# TODO: Think about storing the data directly in the segment trees, similar to how we do it for rank based
+class Proportional:
+    def __init__(self, capacity, alpha_scheduler, beta_scheduler, epsilon=1e-5):
+        self._capacity = capacity  # NOTE: The capacity here might be different than the segment trees' (the next power of 2).  Does this cause any issues ? (I don't believe so)
+        self._alpha_scheduler = alpha_scheduler
+        self._beta_scheduler = beta_scheduler
+        self._sum_tree = SumSegmentTree(capacity)
+        self._min_tree = MinSegmentTree(capacity)    # Is it more efficient to use a Min Priority Queue with a cap similar to the one in RankBased ?
+        self._epsilon = epsilon
+        self._memories = []
+        self._oldest_index = 0
+        self._max_priority = 1
+
+    def store(self, state_t, action_t, reward_tn, state_tpn, gamma_n):
+        experience = Experience(state_t, action_t, reward_tn, state_tpn, gamma_n)
+        
+        if len(self._memories) < self._capacity:
+            self._memories.append(experience)
+        else:
+            self._memories[self._oldest_index] = experience
+
+        self._sum_tree[self._oldest_index] = self._max_priority
+        self._min_tree[self._oldest_index] = self._max_priority
+        self._oldest_index = (self._oldest_index + 1) % self._capacity
+
+    def sample(self, t, batch_size):
+        if len(self._memories) < batch_size:
+            raise RuntimeError("Not enough stored memories (" + str(len(self._memories)) + ") for batch_size of size " + str(batch_size))
+        
+        total_priority_sum = self._sum_tree.sum()
+        segment_indexes = np.linspace(self._epsilon, total_priority_sum, batch_size + 1)  # The smallest possible priority is of size |0| + eps = eps
+        
+        indexes = []
+        for i in range(batch_size):
+            prefix_sum = np.random.uniform(low=segment_indexes[i], high=segment_indexes[i + 1])
+            indexes.append(self._sum_tree.prefix_sum_index(prefix_sum))
+
+        total_sum = self._sum_tree.sum()        
+        sampled_probs = np.zeros(batch_size)
+        experiences = []
+        for i, index in enumerate(indexes):
+            prob = self._sum_tree[index] / total_sum
+            sampled_probs[i] = prob
+            experiences.append(self._memories[index])
+            
+        min_prob = self._min_tree.min() / total_sum
+        beta = self._beta_scheduler.value(t)
+        max_weight = np.power(len(self._memories) * min_prob, -beta)
+        weights = np.power(len(self._memories) * sampled_probs, -beta) / max_weight
+
+        states_t, actions_t, rewards_tn, stats_tpn, gammas_n = zip(*experiences)
+        return states_t, actions_t, rewards_tn, stats_tpn, gammas_n, weights, indexes
+
+    def update_priorities(self, t, indexes, priorities):
+        alpha = self._alpha_scheduler.value(t)
+        priorities = np.abs(priorities) + self._epsilon  # Note: Our implementation may not really be effected by removing an epsilon (uniform sampling from bounds.. unless a priority of 0 is on the end bounds and so prefix_sum never goes that far)
+        
+        for index, priority in zip(indexes, priorities):
+            self._sum_tree[index] = priority**alpha
+            self._min_tree[index] = priority**alpha
+            self._max_priority = max(priority**alpha, self._max_priority)
+
+    def __len__(self):
+        return len(self._memories)
+
 
 class RankBased:
     # TODO: Precompute segments (requires a known batch_size = num_segments)
-    def __init__(self, capacity, num_insertions_until_sort=float('inf')):
+    #       Note the segments change based on N AND alpha
+    def __init__(self, capacity, alpha_scheduler, beta_scheduler, epsilon=1e-5, num_stores_until_sort=float('inf')):
+        self._alpha_scheduler = alpha_scheduler
+        self._beta_scheduler = beta_scheduler
         self._priority_queue = MaxPriorityQueue(capacity)
-        self.num_insertions_until_sort = num_insertions_until_sort
-        self._insertions_since_sort = 0
-        #self._batch_size = batch_size
+        self.num_stores_until_sort = num_stores_until_sort
+        self._stores_since_sort = 0
 
     def _experience_probs(self, alpha):
         # Returns probability of each experience in the priority queue by index (ordered) <-- make this clearer
@@ -159,7 +108,7 @@ class RankBased:
         return probabilities
 
     def _segment(self, probs, num_segments):
-        ## TODO: WRITE DOC-STRING THAT EXPLAINS THE EXTRA SEGMENT AT THE END (and says N + 1 numbers)
+        ## TODO: Explain extra segment at end in doc-string (and says N + 1 numbers)
         ## TODO: Talk about how this algorithm isn't perfect:  Note the addition of cdf part (either way) makes it strange
         cdf = 0
         prob_per_segment = 1 / num_segments
@@ -176,46 +125,47 @@ class RankBased:
         segment_starts.append(len(self._priority_queue))
         return segment_starts           
 
-    # TODO: Perhaps allow a variable number of variables to be stored
-    # TODO: We are now storing gamma rather than terminal, also state_tpn rather than state_tp1 (next_state), etc..  Update variable names
-    def store(self, state, action, reward, next_state, terminal):
-        experience = Experience(state, action, reward, next_state, terminal)
+    def store(self, state_t, action_t, reward_tn, state_tpn, gamma_n):
+        experience = Experience(state_t, action_t, reward_tn, state_tpn, gamma_n)
         max_priority = self._priority_queue.max_priority()
         self._priority_queue.insert(max_priority, experience)
 
-        if self._insertions_since_sort >= self.num_insertions_until_sort:
+        if self._stores_since_sort >= self.num_stores_until_sort:
             self.sort()
-            self._insertions_since_sort = 0
-
-    def update_priorities(self, ids, priorities):
-        self._priority_queue.update_priorities(ids, priorities)
+            self._stores_since_sort = 0
+        else:
+            self._stores_since_sort += 1
         
-    def sample(self, batch_size, alpha, beta):
-        ### TODO: WRITE DOC-STRING
-        ### TODO: ERROR WHEN SAMPLING WITHOUT ENOUGH MEMORIES IN STORAGE
+    def sample(self, t, batch_size):
+        ### TODO: Error when sampling without enough memories in storage
         experiences = []
         order_ids = []
         sampled_probs = np.zeros(batch_size)
 
+        alpha = self._alpha_scheduler.value(t)
         all_probs = self._experience_probs(alpha)
-        segments = self._segment(all_probs, batch_size)
+        prob_segments = self._segment(all_probs, batch_size)
 
         # Sample one transition from each segment (with each segment being of nearly equal probability)
-        for i in range(len(segments) - 1):
-            # Sample uniformly within each segment
-            index = random.randint(segments[i], segments[i + 1] - 1)  # sample in range [start, next_start)
+        for i in range(len(prob_segments) - 1):
+            index = random.randint(prob_segments[i], prob_segments[i + 1] - 1)  # sample in range [start, next_start)
             _, order_id, experience = self._priority_queue[index]
             
             experiences.append(experience)
             order_ids.append(order_id)
             sampled_probs[i] = all_probs[index]
 
-        min_prob = all_probs[-1]
+        min_prob = all_probs[-1]   # Note: This should eventually become a constant.. might be a faster method
+        beta = self._beta_scheduler.value(t)
         max_weight = (len(self._priority_queue) * min_prob)**(-beta)
         weights = np.power(len(self._priority_queue) * sampled_probs, -beta) / max_weight
 
-        states, actions, rewards, next_states, is_terminals = zip(*experiences) 
-        return states, actions, rewards, next_states, is_terminals, weights, order_ids
+        states_t, actions_t, rewards_tn, stats_tpn, gammas_n = zip(*experiences) 
+        return states_t, actions_t, rewards_tn, stats_tpn, gammas_n, weights, order_ids
+
+    def update_priorities(self, t, indexes, priorities):
+        priorities = np.abs(priorities)
+        self._priority_queue.update_priorities(indexes, priorities)
 
     def sort(self):
         self._priority_queue.sort()
@@ -225,8 +175,38 @@ class RankBased:
 
 
 
+##if __name__ == '__main__':
+##    test = Standard(capacity=5)
+##    test.store(1, 2, 3, 4, 0)
+##    test.store(4, 5, 6, 7, 0)
+##    test.store(8, 9, 10, 11, 0)
+##    test.store(12, 13, 14, 15, 0)
+##    test.store(16, 17, 18, 19, 0)
+##    print(test._memories)
+##    print(test.sample(3))
 
-###### The below (and remaining text) are notes on the algorithm implementation and some commented out tests #####
+
+##if __name__ == '__main__':
+##    import annealing_schedules
+##    from data_structures import SumSegmentTree, MinSegmentTree, MaxPriorityQueue
+##    
+##    alpha_scheduler = annealing_schedules.Constant(0.7)
+##    beta_scheduler = annealing_schedules.Constant(0.5)
+##    test = RankBased(8, alpha_scheduler, beta_scheduler)
+####    test = Proportional(8, alpha_scheduler, beta_scheduler)
+##    test.store(1, 2, 3, 4, 0)
+##    test.store(4, 5, 6, 7, 0)
+##    test.store(8, 9, 10, 11, 0)
+##    samples = test.sample(0, 3)
+##    test.update_priorities(2, samples[-1], [0.67, 1.23, 0.23])
+##    print(test.sample(1, 3))
+##    #print(test._max_priority)
+
+
+
+
+
+###### The below (and remaining text) are notes on the rank based algorithm implementation and some commented out tests #####
 
 ## Notes on algorithm implementation:
 ## Two paragraphs from the paper: https://arxiv.org/pdf/1511.05952.pdf TODO: Put in name of paper

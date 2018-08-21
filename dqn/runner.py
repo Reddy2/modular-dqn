@@ -10,7 +10,7 @@ class NStepRunner:
         self._gamma_n = discount_factor**n
         self._queue = deque(maxlen=n)
 
-    def run_episode(self, render=True):
+    def run_episode(self, training=True, render=True):
         # Note: tp1 = t + 1
         t = 0
         state_t = self.env.reset()
@@ -21,24 +21,26 @@ class NStepRunner:
 
             action_t = self.agent.act(state_t)
             state_tp1, reward_tp1, is_terminal_tp1, _ = self.env.step(action_t)
-            self._queue.append((state_t, action_t, reward_tp1))
+            if training:
+                self._queue.append((state_t, action_t, reward_tp1))
             state_t = state_tp1
             episode_reward += reward_tp1
 
             if is_terminal_tp1:
-                while self._queue:
-                    state_k, action_k = self._queue[0][0], self._queue[0][1]
-                    terminal_state = state_tp1
-                    rewards = np.array([self._queue[i][2] for i in range(len(self._queue))])
-                    reward_kn = np.sum(rewards * self._gammas[:len(self._queue)])
-                    self._queue.popleft()
-                    
-                    # state_tpn is terminal so Q(state_tpn, a) = 0.  For n-step TD we can just set gamma = 0 (instead of Q) to get rid of the term
-                    self.agent.observe(state_k, action_k, reward_kn, terminal_state, 0)
+                if training:
+                    while self._queue:
+                        state_k, action_k = self._queue[0][0], self._queue[0][1]
+                        terminal_state = state_tp1
+                        rewards = np.array([self._queue[i][2] for i in range(len(self._queue))])
+                        reward_kn = np.sum(rewards * self._gammas[:len(self._queue)])
+                        self._queue.popleft()
+                        
+                        # state_tpn is terminal so Q(state_tpn, a) = 0.  For n-step TD we can just set gamma = 0 (instead of Q) to get rid of the term
+                        self.agent.observe(state_k, action_k, reward_kn, terminal_state, 0)
                 
                 return episode_reward
 
-            if len(self._queue) == self._n:
+            if training and len(self._queue) == self._n:
                 state_k, action_k = self._queue[0][0], self._queue[0][1]
                 state_kpn = state_tp1
                 rewards = np.array([self._queue[i][2] for i in range(len(self._queue))])
@@ -50,7 +52,7 @@ class NStepRunner:
             self.timesteps_ran += 1
 
     # TODO: Perhaps add in max_timesteps_per_episode parameter
-    def run(self, num_episodes=None, num_timesteps=None, render=True):
+    def run(self, num_episodes=None, num_timesteps=None, training=True, render=True):
         if num_episodes == None and num_timesteps == None:
             num_episodes = 1
 
@@ -58,7 +60,7 @@ class NStepRunner:
         episodes_ran = 0
         
         while True:
-            score = self.run_episode(render)
+            score = self.run_episode(training=training, render=render)
             episodes_ran += 1
 
             print("Episode:", episodes_ran, "Score:", score)

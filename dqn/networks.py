@@ -55,6 +55,8 @@ class Network:
     def __call__(self, *inputs, **kwargs):
         return self._template(*inputs, **kwargs)
 
+    # TODO: Should forward be defined here (at least for clarity?)
+
     @property
     def global_variables(self):
         global_variables = self._template.global_variables
@@ -77,17 +79,19 @@ class NetworkSpec:
     def type(self):
         raise NotImplementedError
 
+# TODO: Perhaps add a custom build function for each NetworkSpec (similar to what we do for losses), as right now we have some issues with duplicate values (action_space in NAF, for example)
 # TODO: Add convolutions
-# TODO: Allow activation parameter
 # TODO: Dueling only needs to use the advantage stream to evaluate the best q-value for exploration (see dueling dqn paper)
 #       We may be able to do this in the call method by having an "exploration" option or something similar.. seems to get rid of modularity though
 class QNetwork(NetworkSpec):
-    def __init__(self, hiddens, num_actions, noisy_net=False, dueling=None):
+    def __init__(self, hiddens, num_actions, activation_fn=tf.nn.relu, noisy_net=False, dueling=None):
         self._hiddens = hiddens
         self.num_actions = num_actions
+        self.activation_fn = activation_fn
         self.noisy_net = noisy_net
         self.dueling = dueling
-        
+
+## TODO: Dueling with separate number of hiddens for value/advantage streams
 ##        if dueling and np.array(dueling).ndim == 1:
 ##            dueling = np.tile(, (2, 1))
 
@@ -107,18 +111,17 @@ class QNetwork(NetworkSpec):
     def forward(self, state):
         out = state
         for index, hidden in enumerate(self._hiddens):
-            out = self._layer(inputs=out, num_outputs=hidden, scope='fully_connected' + str(index))
+            out = self._layer(inputs=out, num_outputs=hidden, activation_fn=self.activation_fn, scope='fully_connected' + str(index))
 
         if self.dueling is not None:   # Note: [] is allowed (so don't use if self.dueling:)
             value = out
             for index, hidden in enumerate(self.dueling):
-                value = self._layer(inputs=value, num_outputs=hidden, scope='value_fully_connected' + str(index))
+                value = self._layer(inputs=value, num_outputs=hidden, activation_fn=self.activation_fn, scope='value_fully_connected' + str(index))
             value = self._layer(inputs=out, num_outputs=1, activation_fn=None, scope='value_output_fully_connected')
 
             advantage = out
             for index, hidden in enumerate(self.dueling):
-                advantage = self._layer(inputs=advantage, num_outputs=hidden, scope='advantage_fully_connected' + str(index))
-
+                advantage = self._layer(inputs=advantage, num_outputs=hidden, activation_fn=self.activation_fn, scope='advantage_fully_connected' + str(index))
             advantage = self._layer(inputs=out, num_outputs=self.num_actions, activation_fn=None, scope='advantage_output_fully_connected')
             advantage_mean = tf.reduce_mean(advantage, axis=1, keepdims=True)
 
@@ -134,11 +137,12 @@ class QNetwork(NetworkSpec):
 
 
 class DistributionalQNetwork(NetworkSpec):
-    def __init__(self, hiddens, num_actions, n, noisy_net=False, dueling=None):
+    def __init__(self, hiddens, num_actions, n, activation_fn=tf.nn.relu, noisy_net=False, dueling=None):
         # (for now) n represents either the number of atoms (categorical) or number of quantiles (quantile regression)
         self._hiddens = hiddens
         self.num_actions = num_actions
         self.n = n
+        self.activation_fn = activation_fn
         self.noisy_net = noisy_net
         self.dueling = dueling
 
@@ -149,19 +153,18 @@ class DistributionalQNetwork(NetworkSpec):
     def forward(self, state):
         out = state
         for index, hidden in enumerate(self._hiddens):
-            out = self._layer(inputs=out, num_outputs=hidden, scope='fully_connected' + str(index))
+            out = self._layer(inputs=out, num_outputs=hidden, activation_fn=self.activation_fn, scope='fully_connected' + str(index))
 
         if self.dueling is not None:   # Note: [] is allowed (so don't use if self.dueling:)
             value = out
             for index, hidden in enumerate(self.dueling):
-                value = self._layer(inputs=value, num_outputs=hidden, scope='value_fully_connected' + str(index))
+                value = self._layer(inputs=value, num_outputs=hidden, activation_fn=self.activation_fn, scope='value_fully_connected' + str(index))
             value = self._layer(inputs=out, num_outputs=self.n, activation_fn=None, scope='value_output_fully_connected')
             value = tf.expand_dims(value, axis=1)
             
             advantage = out
             for index, hidden in enumerate(self.dueling):
-                advantage = self._layer(inputs=advantage, num_outputs=hidden, scope='advantage_fully_connected' + str(index))
-
+                advantage = self._layer(inputs=advantage, num_outputs=hidden, activation_fn=self.activation_fn, scope='advantage_fully_connected' + str(index))
             advantage = self._layer(inputs=out, num_outputs=self.num_actions * self.n , activation_fn=None, scope='advantage_output_fully_connected')
             advantage = tf.reshape(advantage, [-1, self.num_actions, self.n])
             advantage_mean = tf.reduce_mean(advantage, axis=1, keepdims=True)
@@ -179,3 +182,52 @@ class DistributionalQNetwork(NetworkSpec):
     @property
     def type(self):
         return 'distributional'
+
+
+class NAFQNetwork(NetworkSpec):
+    # TODO: Explain shared_hiddens behavior/diagonal_l
+    # TODO: Document that if overwritten for a custom network, self._diagonal_l must be specified
+    def __init__(self, mu_hiddens, value_hiddens, l_hiddens, action_space_shape, shared_hiddens=None, activation_fn=tf.nn.relu, diagonal_l=False, noisy_net=False):
+        self._mu_hiddens = mu_hiddens
+        self._value_hiddens = value_hiddens
+        self._l_hiddens = l_hiddens
+        self.action_space_shape = action_space_shape
+        self._shared_hiddens = shared_hiddens
+        self._activation_fn = activation_fn
+        
+        self._layer = layers.fully_connected
+        if noisy_net:
+            self._layer = noisy_fully_connected
+
+        self._diagonal_l = diagonal_l
+        self.num_l_outputs = action_space_shape[0] if diagonal_l else action_space_shape[0] * (action_space_shape[0] + 1) // 2
+
+    def forward(self, state):
+        out = state
+        
+        if self._shared_hiddens is not None:   # Note: [] is allowed (so don't use if self._shared_hiddens):            
+            for index, hidden in enumerate(self._shared_hiddens):
+                out = self._layer(inputs=out, num_outputs=hidden, activation_fn=self._activation_fn, scope='fully_connected' + str(index))
+            
+        for index, hidden in enumerate(self._mu_hiddens):
+            mu = self._layer(inputs=out, num_outputs=hidden, activation_fn=self._activation_fn, scope='mu_fully_connected' + str(index))
+        mu = self._layer(inputs=out, num_outputs=self.action_space_shape[0], activation_fn=None, scope='mu_output_fully_connected')
+
+        for index, hidden in enumerate(self._value_hiddens):
+            value = self._layer(inputs=out, num_outputs=hidden, activation_fn=self._activation_fn, scope='value_fully_connected' + str(index))
+        value = self._layer(inputs=out, num_outputs=1, activation_fn=None, scope='value_output_fully_connected')
+        value = tf.squeeze(value)
+
+        for index, hidden in enumerate(self._l_hiddens):
+            flat_l = self._layer(inputs=out, num_outputs=hidden, activation_fn=self._activation_fn, scope='l_fully_connected' + str(index))
+        flat_l = self._layer(inputs=out, num_outputs=self.num_l_outputs, activation_fn=None, scope='l_output_fully_connected')
+        
+        return mu, value, flat_l
+
+    @property
+    def diagonal_l(self):
+        return self._diagonal_l
+        
+    @property
+    def type(self):
+        return 'naf'
