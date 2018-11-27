@@ -28,6 +28,7 @@ This is an attempt to modularize many of the most effective extensions of the DQ
 - I hope to add the following:
   - [Hindsight Experience Replay](https://arxiv.org/pdf/1707.01495.pdf) (HER)
   - [Random Network Distillation](https://arxiv.org/pdf/1810.12894.pdf) (RND)
+- Add [Horovod](https://github.com/uber/horovod) support for distributed training
 - If possible to modularize, I would like to extend this module to include policy gradient methods such as PPO, rather than just DQN  
 - I would like to add support for PyTorch
 
